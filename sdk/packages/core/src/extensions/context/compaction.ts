@@ -564,9 +564,11 @@ export function createContextCompactionPrepareTurn(
 			} else if (userCompaction?.compact) {
 				result = await userCompaction.compact(compactionContext);
 			} else {
+				let threwDuringAgentic = false;
 				try {
 					result = await runBuiltinStrategy(builtinOptions);
 				} catch (error) {
+					threwDuringAgentic = true;
 					if (
 						strategy !== "agentic" ||
 						isCompactionCancellation(error, context.abortSignal)
@@ -578,6 +580,25 @@ export function createContextCompactionPrepareTurn(
 						{
 							severity: "warn",
 							...describeCompactionError(error),
+						},
+					);
+					executedStrategy = "basic";
+					result = await BUILTIN_COMPACTION_STRATEGIES.basic(builtinOptions);
+				}
+				// A decline is not a failure to throw on: agentic compaction
+				// returns undefined (e.g. when its summarizer request cannot be
+				// budgeted to fit the window, or returns no content) instead of
+				// throwing. Without this branch that undefined would fall through
+				// to the "skipped" path and the turn would proceed with an
+				// overflowing request. Fall back to basic compaction on a
+				// declined agentic attempt, mirroring the throw-based fallback.
+				// The `threwDuringAgentic` guard avoids re-running basic when the
+				// catch above already handled the failure.
+				if (!threwDuringAgentic && strategy === "agentic" && !result?.messages) {
+					config.logger?.log(
+						"Agentic compaction declined; falling back to basic compaction",
+						{
+							severity: "warn",
 						},
 					);
 					executedStrategy = "basic";

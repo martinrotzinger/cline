@@ -1574,10 +1574,14 @@ describe("createContextCompactionPrepareTurn", () => {
 		expect(explicitWins.maxOutputTokens).toBe(6_000);
 	});
 
-	it("skips with a diagnostic warning when the summarizer only produced reasoning output", async () => {
+	it("falls back to basic compaction when the summarizer only produced reasoning output", async () => {
 		// Repro for CLINE-2911: a reasoning model can spend the entire output
 		// budget thinking. Reasoning chunks are discarded, so no summary text
-		// arrives and compaction is skipped — that skip must be diagnosable.
+		// arrives and the agentic strategy declines (returns undefined) rather
+		// than throwing. Before the Case B fix that decline fell through to a
+		// "skipped" notice and the turn would proceed with an overflowing
+		// request; now the orchestrator falls back to basic compaction so the
+		// request is still reduced. The agentic decline must remain diagnosable.
 		const logger = { debug: vi.fn(), log: vi.fn() };
 		const emitStatusNotice = vi.fn();
 		createHandlerMock.mockReturnValue({
@@ -1641,11 +1645,7 @@ describe("createContextCompactionPrepareTurn", () => {
 			emitStatusNotice,
 		});
 
-		expect(result).toBeUndefined();
-		expect(emitStatusNotice).toHaveBeenCalledWith(
-			"auto-compaction-skipped",
-			expect.objectContaining({ phase: "skipped" }),
-		);
+		// The agentic decline is still diagnosable...
 		expect(logger.log).toHaveBeenCalledWith(
 			"Skipped agentic compaction: summarizer returned no summary text",
 			expect.objectContaining({
@@ -1655,6 +1655,82 @@ describe("createContextCompactionPrepareTurn", () => {
 				likelyCause: "output_budget_consumed_by_reasoning",
 			}),
 		);
+		// ...and the orchestrator fell back to basic compaction instead of
+		// skipping, so a reduced transcript is returned.
+		expect(result?.messages).toBeDefined();
+		expect(result?.messages.length).toBeGreaterThan(0);
+		expect(emitStatusNotice).toHaveBeenCalledWith(
+			"auto-compacted",
+			expect.objectContaining({ phase: "completed" }),
+		);
+	});
+
+	it("falls back to basic compaction when the agentic summarizer cannot be budgeted to fit", async () => {
+		// The other real-world decline: the summarizer model's own window is too
+		// small to hold the transcript that needs summarizing, so agentic
+		// compaction declines (returns undefined) before any LLM call. The
+		// orchestrator must fall back to basic compaction rather than leaving an
+		// overflowing request on the table.
+		const logger = { debug: vi.fn(), log: vi.fn() };
+		const emitStatusNotice = vi.fn();
+		// The handler is created by agentic compaction for the summarizer; the
+		// decline happens before createMessage is invoked, so no chunks flow.
+		createHandlerMock.mockReturnValue({
+			createMessage: vi.fn(() => streamChunks([])),
+		});
+
+		const prepareTurn = createContextCompactionPrepareTurn({
+			providerId: "anthropic",
+			modelId: "mock-model",
+			providerConfig: {
+				providerId: "anthropic",
+				modelId: "mock-model",
+				// The summarizer inherits the active model's tiny window, so the
+				// transcript to summarize cannot be budgeted to fit it.
+				modelInfo: { id: "mock-model", maxInputTokens: 40 },
+			} as LlmsProviders.ProviderConfig,
+			compaction: {
+				enabled: true,
+				strategy: "agentic",
+				preserveRecentTokens: 1,
+			},
+			logger,
+		});
+
+		const result = await prepareTurn?.({
+			agentId: "agent-1",
+			conversationId: "conv-1",
+			parentAgentId: null,
+			iteration: 1,
+			abortSignal: new AbortController().signal,
+			systemPrompt: "You are helpful.",
+			tools: [],
+			messages: [
+				{ role: "user", content: "Old turn" },
+				{ role: "assistant", content: "Old answer" },
+				{ role: "user", content: "Latest turn" },
+				{ role: "assistant", content: "Latest answer" },
+			],
+			apiMessages: [
+				{ role: "user", content: "Old turn" },
+				{ role: "assistant", content: "Old answer" },
+				{ role: "user", content: "Latest turn" },
+				{ role: "assistant", content: "Latest answer" },
+			],
+			model: {
+				id: "mock-model",
+				provider: "anthropic",
+				info: { id: "mock-model", maxInputTokens: 40 },
+			},
+			emitStatusNotice,
+		});
+
+		expect(emitStatusNotice).toHaveBeenCalledWith(
+			"auto-compacted",
+			expect.objectContaining({ phase: "completed" }),
+		);
+		expect(result?.messages).toBeDefined();
+		expect(result?.messages.length).toBeGreaterThan(0);
 	});
 
 	it("preserves summarizer modelInfo without a nested providerConfig", () => {
@@ -4300,7 +4376,13 @@ describe("createContextCompactionPrepareTurn", () => {
 		expect(result?.messages[2]?.content).toBe("Latest user turn");
 	});
 
-	it("does not compact when only pre-truncation messages exceed the threshold", async () => {
+	it("does not compact when only the pre-truncation messages exceed the threshold", async () => {
+		// The trigger is computed from the post-truncation API payload
+		// (apiMessages), which is what the provider would actually see. The raw
+		// `messages` may look larger (e.g. a tool result not yet truncated for
+		// the wire), but that must not trigger compaction on its own. Here the
+		// api payload stays under the trigger, so no compaction runs and no
+		// summarizer handler is created.
 		const prepareTurn = createContextCompactionPrepareTurn({
 			providerId: "anthropic",
 			modelId: "mock-model",
@@ -4346,7 +4428,10 @@ describe("createContextCompactionPrepareTurn", () => {
 							type: "tool_result",
 							tool_use_id: "tool-1",
 							name: "tool",
-							content: "x".repeat(100),
+							// Small enough that the post-truncation payload stays
+							// under the trigger, even though the raw messages do
+							// not.
+							content: "x".repeat(20),
 						},
 					],
 				},
