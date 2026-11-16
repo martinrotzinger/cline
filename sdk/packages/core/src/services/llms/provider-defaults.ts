@@ -148,6 +148,7 @@ async function mergeKnownModels(
 	privateModels: Record<string, ModelInfo> = {},
 	publicModels: Record<string, ModelInfo> = {},
 	userKnownModels: Record<string, ModelInfo> = {},
+	registryModels: Record<string, ModelInfo> = {},
 ): Promise<Record<string, ModelInfo>> {
 	if (providerId === "litellm") {
 		return Llms.sortModelsByReleaseDate(privateModels);
@@ -174,6 +175,7 @@ async function mergeKnownModels(
 	if (hasPublicModelSource) {
 		return Llms.sortModelsByReleaseDate({
 			...publicModels,
+			...registryModels,
 			...userKnownModels,
 		});
 	}
@@ -182,6 +184,7 @@ async function mergeKnownModels(
 			...defaultKnownModels,
 			...Llms.filterOpenAICodexModels(liveModels),
 			...publicModels,
+			...registryModels,
 			...userKnownModels,
 		});
 	}
@@ -192,6 +195,7 @@ async function mergeKnownModels(
 		// live list, and it must stay a subscription model, not a free one.
 		return {
 			...liveModels,
+			...registryModels,
 			...userKnownModels,
 		};
 	}
@@ -218,6 +222,7 @@ async function mergeKnownModels(
 					knownModelsWithoutUserOverrides,
 					Llms.VERCEL_OPENROUTER_MODEL_ID_ALIAS_RULES,
 				),
+				...registryModels,
 				...userKnownModels,
 			}),
 		);
@@ -225,6 +230,7 @@ async function mergeKnownModels(
 
 	return Llms.sortModelsByReleaseDate({
 		...knownModelsWithoutUserOverrides,
+		...registryModels,
 		...userKnownModels,
 	});
 }
@@ -981,6 +987,9 @@ export async function resolveProviderConfig(
 					return {};
 				})
 			: {};
+		const registryModels = await Llms.getModelOverridesForProvider(
+			providerId,
+		);
 		const knownModels = await mergeKnownModels(
 			providerId,
 			defaults.knownModels,
@@ -988,6 +997,7 @@ export async function resolveProviderConfig(
 			privateModels,
 			publicModels,
 			config?.knownModels,
+			registryModels,
 		);
 
 		return {
